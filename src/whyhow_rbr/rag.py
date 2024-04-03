@@ -5,10 +5,14 @@ import os
 import pathlib
 import re
 import uuid
-from typing import Any, Literal, TypedDict, cast
+from typing import Any, Literal, TypedDict, cast, Dict, List
 
+from elasticsearch import Elasticsearch, NotFoundError
+from elasticsearch.helpers import bulk
 from langchain_core.documents import Document
 from openai import OpenAI
+from openai import AzureOpenAI
+
 from pinecone import (
     Index,
     NotFoundException,
@@ -31,43 +35,21 @@ from whyhow_rbr.exceptions import (
     OpenAIException,
 )
 from whyhow_rbr.processing import clean_chunks, parse_and_split
+from typing import Optional
 
 logger = logging.getLogger(__name__)
-
 
 # Defaults
 DEFAULT_SPEC = ServerlessSpec(cloud="aws", region="us-west-2")
 
 
 # Custom classes
-class PineconeMetadata(BaseModel, extra="forbid"):
-    """The metadata to be stored in Pinecone.
-
-    Attributes
-    ----------
-    text : str
-        The text of the document.
-
-    page_number : int
-        The page number of the document.
-
-    chunk_number : int
-        The chunk number of the document.
-
-    filename : str
-        The filename of the document.
-
-    uuid : str
-        The UUID of the document. Note that this is not required to be
-        provided when creating the metadata. It is generated automatically
-        when creating the PineconeDocument.
-    """
-
+class PineconeMetadata(BaseModel):
     text: str
     page_number: int
     chunk_number: int
     filename: str
-    uuid: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    uuid: str
 
 
 class PineconeDocument(BaseModel, extra="forbid"):
@@ -105,26 +87,13 @@ class PineconeDocument(BaseModel, extra="forbid"):
         return self
 
 
-class PineconeMatch(BaseModel, extra="ignore"):
-    """The match returned from Pinecone.
-
-    Attributes
-    ----------
-    id : str
-        The ID of the document.
-
-    score : float
-        The score of the match. Its meaning depends on the metric used for
-        the index.
-
-    metadata : PineconeMetadata
-        The metadata of the document.
-
-    """
-
+class PineconeMatch(BaseModel):
     id: str
-    score: float
+    score: Optional[float]
     metadata: PineconeMetadata
+
+    class Config:
+        extra = "ignore"
 
 
 class Rule(BaseModel):
@@ -147,7 +116,7 @@ class Rule(BaseModel):
         The keywords to trigger a rule.
     """
 
-    filename: str | None = None
+    filename: list[str] | None = None
     uuid: str | None = None
     page_numbers: list[int] | None = None
     keywords: list[str] | None = None
@@ -166,20 +135,21 @@ class Rule(BaseModel):
             return None
         return s
 
-    def to_filter(self) -> dict[str, list[dict[str, Any]]] | None:
-        """Convert rule to Pinecone filter format."""
+    def to_filter(self) -> dict[str, dict[str, list[dict[str, Any]]]] | None:
+        """Convert rule to Elasticsearch filter format."""
         if not any([self.filename, self.uuid, self.page_numbers]):
             return None
 
         conditions: list[dict[str, Any]] = []
-        if self.filename is not None:
-            conditions.append({"filename": {"$eq": self.filename}})
-        if self.uuid is not None:
-            conditions.append({"uuid": {"$eq": self.uuid}})
-        if self.page_numbers is not None:
-            conditions.append({"page_number": {"$in": self.page_numbers}})
 
-        filter_ = {"$and": conditions}
+        if self.filename is not None:
+            conditions.append({"term": {"filename": self.filename}})
+        if self.uuid is not None:
+            conditions.append({"term": {"uuid": self.uuid}})
+        if self.page_numbers is not None:
+            conditions.append({"terms": {"page_number": self.page_numbers}})
+
+        filter_ = {"bool": {"must": conditions}}
         return filter_
 
 
@@ -317,14 +287,19 @@ Both the input and the output are JSON objects.
 
 """
 
+from elasticsearch import Elasticsearch
+import os
+from openai import OpenAI
+
 
 class Client:
-    """Synchronous client."""
+    """Synchronous client for Elasticsearch."""
 
     def __init__(
-        self,
-        openai_api_key: str | None = None,
-        pinecone_api_key: str | None = None,
+            self,
+            openai_api_key: str | None = None,
+            elasticsearch_host: str = "localhost",
+            elasticsearch_port: int = 9200,
     ):
         if openai_api_key is None:
             openai_api_key = os.environ.get("OPENAI_API_KEY")
@@ -332,23 +307,19 @@ class Client:
                 raise ValueError(
                     "No OPENAI_API_KEY provided must be provided."
                 )
+        self.openai_client = AzureOpenAI(
+            api_key="5af57014da27466c92961c3c915cfc96", api_version="2023-05-15",
+            azure_endpoint="https://open-ai-elgen.openai.azure.com/")
+        self.elasticsearch_client = Elasticsearch(
+            [{'host': "localhost", 'port': int(9201), 'scheme': 'http'}])
 
-        if pinecone_api_key is None:
-            pinecone_api_key = os.environ.get("PINECONE_API_KEY")
-            if pinecone_api_key is None:
-                raise ValueError("No PINECONE_API_KEY provided")
-
-        self.openai_client = OpenAI(api_key=openai_api_key)
-        self.pinecone_client = Pinecone(api_key=pinecone_api_key)
-
-    def get_index(self, name: str) -> Index:
-        """Get an existing index.
+    def get_index(self, name: str):
+        """Get an existing index from Elasticsearch.
 
         Parameters
         ----------
         name : str
             The name of the index.
-
 
         Returns
         -------
@@ -362,22 +333,23 @@ class Client:
 
         """
         try:
-            index = self.pinecone_client.Index(name)
-        except NotFoundException as e:
+            if self.elasticsearch_client.indices.exists(index=name):
+                return name
+            else:
+                raise NotFoundError(f"Index {name} does not exist")
+        except NotFoundError as e:
             raise IndexNotFoundException(f"Index {name} does not exist") from e
 
-        return index
-
     def create_index(
-        self,
-        name: str,
-        dimension: int = 1536,
-        metric: Metric = "cosine",
-        spec: ServerlessSpec | PodSpec | None = None,
-    ) -> Index:
-        """Create a new index.
+            self,
+            name: str,
+            dimension: int = 1536,
+            metric: str = "cosine",
+            spec: ServerlessSpec | PodSpec | None = None,
+    ):
+        """Create a new index in Elasticsearch.
 
-        If the index does not exist, it creates a new index with the specified.
+        If the index does not exist, it creates a new index with the specified parameters.
 
         Parameters
         ----------
@@ -387,7 +359,7 @@ class Client:
         dimension : int
             The dimension of the index.
 
-        metric : Metric
+        metric : str
             The metric of the index.
 
         spec : ServerlessSpec | PodSpec | None
@@ -399,53 +371,37 @@ class Client:
             If the index already exists.
 
         """
-        try:
-            self.get_index(name)
-        except IndexNotFoundException:
-            pass
-        else:
+        if self.elasticsearch_client.indices.exists(index=name):
             raise IndexAlreadyExistsException(f"Index {name} already exists")
 
         if spec is None:
             spec = DEFAULT_SPEC
             logger.info(f"Using default spec {spec}")
 
-        self.pinecone_client.create_index(
-            name=name, dimension=dimension, metric=metric, spec=spec
-        )
-        index = self.pinecone_client.Index(name)
+        # Create index mapping and settings (if necessary)
+        body = {
+            'mappings': {
+                'properties': {
+                    'embedding': {
+                        'type': 'dense_vector',
+                        "dims": dimension,
+                        "similarity": metric
+                    }
+                }
+            }}
 
-        return index
+        self.elasticsearch_client.indices.create(index=name, body=body)
+
+        return name
 
     def upload_documents(
-        self,
-        index: Index,
-        documents: list[str | pathlib.Path],
-        namespace: str,
-        embedding_model: str = "text-embedding-3-small",
-        batch_size: int = 100,
+            self,
+            index: str,
+            documents: list[str | pathlib.Path],
+            namespace: str,
+            embedding_model: str = "text-embedding-3-small",
+            batch_size: int = 100,
     ) -> None:
-        """Upload documents to the index.
-
-        Parameters
-        ----------
-        index : Index
-            The index.
-
-        documents : list[str | pathlib.Path]
-            The documents to upload.
-
-        namespace : str
-            The namespace within the index to use.
-
-        batch_size : int
-            The number of documents to upload at a time.
-
-        embedding_model : str
-            The OpenAI embedding model to use.
-
-        """
-        # don't allow for duplicate documents
         documents = list(set(documents))
         if not documents:
             logger.info("No documents to upload")
@@ -460,9 +416,10 @@ class Client:
 
         logger.info(f"Embedding {len(all_chunks)} chunks")
         embeddings = generate_embeddings(
-            openai_api_key=self.openai_client.api_key,
+            # openai_api_key=self.openai_client.api_key,
             chunks=[c.page_content for c in all_chunks],
             model=embedding_model,
+            model_name_or_path="sentence-transformers/all-MiniLM-L6-v2"
         )
 
         if len(embeddings) != len(all_chunks):
@@ -470,32 +427,28 @@ class Client:
                 "Number of embeddings does not match number of chunks"
             )
 
-        # create PineconeDocuments
         pinecone_documents = []
         for i, (chunk, embedding) in enumerate(zip(all_chunks, embeddings)):
-            metadata = PineconeMetadata(
-                text=chunk.page_content,
-                page_number=chunk.metadata["page"],
-                chunk_number=chunk.metadata["chunk"],
-                filename=chunk.metadata["source"],
-            )
-            pinecone_document = PineconeDocument(
-                values=embedding,
-                metadata=metadata,
-            )
-            pinecone_documents.append(pinecone_document)
-
-        upsert_documents = [d.model_dump() for d in pinecone_documents]
-
-        response = index.upsert(
-            upsert_documents, namespace=namespace, batch_size=batch_size
-        )
-        n_upserted = response["upserted_count"]
-        logger.info(f"Upserted {n_upserted} documents")
+            metadata = {
+                "text": chunk.page_content,
+                "page_number": chunk.metadata["page"],
+                "chunk_number": chunk.metadata["chunk"],
+                "filename": chunk.metadata["source"],
+                "uuid": str(uuid.uuid4())
+            }
+            document = {
+                "_source": {
+                    "metadata": metadata,
+                    "values": embedding,
+                    "id": str(uuid.uuid4())
+                }}
+            pinecone_documents.append(document)
+            self.elasticsearch_client.index(index=f"{index}_{namespace}", id=document["_source"]["id"],
+                                            body=document["_source"])
 
     def clean_text(
-        self,
-        text: str
+            self,
+            text: str
     ) -> str:
         """Return a lower case version of text with punctuation removed.
 
@@ -513,19 +466,19 @@ class Client:
         return text_processed_further
 
     def query(
-        self,
-        question: str,
-        index: Index,
-        namespace: str,
-        rules: list[Rule] | None = None,
-        top_k: int = 5,
-        chat_model: str = "gpt-4-1106-preview",
-        chat_temperature: float = 0.0,
-        chat_max_tokens: int = 1000,
-        chat_seed: int = 2,
-        embedding_model: str = "text-embedding-3-small",
-        process_rules_separately: bool = False,
-        keyword_trigger: bool = False
+            self,
+            question: str,
+            index: str,
+            namespace: str,
+            rules: list[Rule] | None = None,
+            top_k: int = 5,
+            chat_model: str = "gpt-35-turbo-16k",
+            chat_temperature: float = 0.0,
+            chat_max_tokens: int = 1000,
+            chat_seed: int = 2,
+            embedding_model: str = "text-embedding-3-small",
+            process_rules_separately: bool = False,
+            keyword_trigger: bool = False
     ) -> QueryReturnType:
         """Query the index.
 
@@ -534,8 +487,8 @@ class Client:
         question : str
             The question to ask.
 
-        index : Index
-            The index to query.
+        index : str
+            The name of the Elasticsearch index to query.
 
         namespace : str
             The namespace within the index to use.
@@ -607,7 +560,7 @@ class Client:
             rules = triggered_rules
 
         rule_filters = [rule.to_filter() for rule in rules if rule is not None]
-
+        print(rule_filters, "ruleeeee")
         question_embedding = generate_embeddings(
             openai_api_key=self.openai_client.api_key,
             chunks=[question],
@@ -620,59 +573,120 @@ class Client:
         # Check if there are any rule filters, and if not, proceed with a default query
         if not rule_filters:
             # Perform a default query
-            query_response = index.query(
-                namespace=namespace,
-                top_k=top_k,
-                vector=question_embedding,
-                filter=None,  # No specific filter, or you can define a default filter as per your application's logic
-                include_metadata=True,
-            )
-            matches = [
-                PineconeMatch(**m.to_dict()) for m in query_response["matches"]
-            ]
-            match_texts = [m.metadata.text for m in matches]
+            query = {
+                "query": {
+                    "match": {
+                        "metadata.text": question
+                    }
+                },
+                "size": top_k
+            }
+            response = self.elasticsearch_client.search(index=f"{index}_{namespace}", body=query)
+            hits = response["hits"]["hits"]
+            for hit in hits:
+                match = hit["_source"]
+                matches.append(PineconeMatch(
+                    id=match["id"],
+                    score=None,  # Score not used in Elasticsearch
+                    metadata=PineconeMetadata(
+                        text=match["metadata"]["text"],
+                        page_number=match["metadata"]["page_number"],
+                        chunk_number=match["metadata"]["chunk_number"],
+                        filename=match["metadata"]["filename"],
+                        uuid=match["metadata"]["uuid"]
+                    )
+                ))
+                match_texts.append(match["metadata"]["text"])
 
         else:
-
             if process_rules_separately:
                 for rule_filter in rule_filters:
                     if rule_filter:
-                        query_response = index.query(
-                            namespace=namespace,
-                            top_k=top_k,
-                            vector=question_embedding,
-                            filter=rule_filter,
-                            include_metadata=True,
-                        )
-                        matches.extend([
-                            PineconeMatch(**m.to_dict()) for m in query_response["matches"]
-                        ])
-                        match_texts += [m.metadata.text for m in matches]
-                match_texts = list(set(match_texts))  # Ensure unique match texts
+                        query = {
+                            "query": {
+                                "bool": {
+                                    "filter": rule_filter,
+                                    "must": {
+                                        "match": {
+                                            "metadata.text": question
+                                        }
+                                    }
+                                }
+                            },
+                            "size": top_k
+                        }
+                        response = self.elasticsearch_client.search(index=f"{index}_{namespace}")
+                        hits = response["hits"]["hits"]
+                        for hit in hits:
+                            match = hit["_source"]
+                            matches.append(PineconeMatch(
+                                id=match["id"],
+                                score=None,  # Score not used in Elasticsearch
+                                metadata=PineconeMetadata(
+                                    text=match["metadata"]["text"],
+                                    page_number=match["metadata"]["page_number"],
+                                    chunk_number=match["metadata"]["chunk_number"],
+                                    filename=match["metadata"]["filename"],
+                                    uuid=match["metadata"]["uuid"]
+                                )
+                            ))
+                            match_texts.append(match["metadata"]["text"])
             else:
                 if rule_filters:
-                    combined_filters = []
-                    for rule_filter in rule_filters:
-                        if rule_filter:
-                            combined_filters.append(rule_filter)
+                    # Combine filters with AND operator
+                    print((rule_filters, "ruleeeeeee"))
+                    queries = []
 
-                    rule_filter = {"$or": combined_filters} if combined_filters else None
+                    # Loop over all filenames
+                    for filename_term in rule_filters[0]['bool']['must'][0]['term']['filename']:
+                        # Loop over all page numbers
+                        for page_number_term in rule_filters[0]['bool']['must'][1]['terms']['page_number']:
+                            # Create a query for each combination of filename and page number
+                            query = {
+                                "query": {
+                                    "bool": {
+                                        "must": [
+                                            {"match": {"metadata.page_number": page_number_term}},
+                                            {"match": {"metadata.filename": filename_term}}
+                                        ]
+                                    }
+                                }
+                            }
+                            # Append the query to the list of queries
+                            queries.append(query)
+
                 else:
-                    rule_filter = None  # Fallback to a default query when no rules are provided or valid
-
-                if rule_filter is not None:
-                    query_response = index.query(
-                        namespace=namespace,
-                        top_k=top_k,
-                        vector=question_embedding,
-                        filter=rule_filter,
-                        include_metadata=True,
-                    )
-                    matches = [
-                        PineconeMatch(**m.to_dict()) for m in query_response["matches"]
-                    ]
-                    match_texts = [m.metadata.text for m in matches]
-
+                    # Fallback to a default query when no rules are provided or valid
+                    query = {
+                        "query": {
+                            "match": {
+                                "metadata.text": question
+                            }
+                        },
+                        "size": top_k
+                    }
+                hitss=[]
+                for query in queries:
+                    response = self.elasticsearch_client.search(index=f"{index}_{namespace}", body=query)
+                    print(response, "responseeeee")
+                    hits = response["hits"]["hits"]
+                    hitss.append(hits)
+                    for hits in hitss:
+                        for hit in hits:
+                            match = hit["_source"]
+                            matches.append(PineconeMatch(
+                                id=match["id"],
+                                score=None,  # Score not used in Elasticsearch
+                                metadata=PineconeMetadata(
+                                    text=match["metadata"]["text"],
+                                    page_number=match["metadata"]["page_number"],
+                                    chunk_number=match["metadata"]["chunk_number"],
+                                    filename=match["metadata"]["filename"],
+                                    uuid=match["metadata"]["uuid"]
+                                )
+                            ))
+                            match_texts.append(match["metadata"]["text"])
+        print("----------------",match_texts)
         # Proceed to create prompt, send it to OpenAI, and handle the response
         prompt = self.create_prompt(question, match_texts)
         response = self.openai_client.chat.completions.create(
@@ -749,7 +763,7 @@ class Client:
         if response_raw.startswith("```json"):
             start_i = response_raw.index("{")
             end_i = response_raw.rindex("}")
-            response_raw = response_raw[start_i : end_i + 1]
+            response_raw = response_raw[start_i: end_i + 1]
 
         try:
             output = Output.model_validate_json(response_raw)
