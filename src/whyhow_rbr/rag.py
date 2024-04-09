@@ -291,15 +291,16 @@ from elasticsearch import Elasticsearch
 import os
 from openai import OpenAI
 
-
 class Client:
     """Synchronous client for Elasticsearch."""
 
     def __init__(
             self,
             openai_api_key: str | None = None,
+            api_version: str | None = None,
+            azure_endpoint: str | None = None,
             elasticsearch_host: str = "localhost",
-            elasticsearch_port: int = 9200,
+            elasticsearch_port: int = 9201,
     ):
         if openai_api_key is None:
             openai_api_key = os.environ.get("OPENAI_API_KEY")
@@ -308,10 +309,10 @@ class Client:
                     "No OPENAI_API_KEY provided must be provided."
                 )
         self.openai_client = AzureOpenAI(
-            api_key="5af57014da27466c92961c3c915cfc96", api_version="2023-05-15",
-            azure_endpoint="https://open-ai-elgen.openai.azure.com/")
+            api_key=openai_api_key, api_version=api_version,
+            azure_endpoint=azure_endpoint)
         self.elasticsearch_client = Elasticsearch(
-            [{'host': "localhost", 'port': int(9201), 'scheme': 'http'}])
+            [{'host': elasticsearch_host, 'port': int(elasticsearch_port), 'scheme': 'http'}])
 
     def get_index(self, name: str):
         """Get an existing index from Elasticsearch.
@@ -541,7 +542,7 @@ class Client:
             include the chat model not finishing or the response not being
             valid JSON.
         """
-        logger.info(f'Raw rules: {rules}')
+        print(f'Raw rules: {rules}')
 
         if rules is None:
             rules = []
@@ -553,7 +554,6 @@ class Client:
             for rule in rules:
                 if rule.keywords:
                     clean_keywords = [self.clean_text(keyword) for keyword in rule.keywords]
-
                     if bool(set(clean_keywords) & set(clean_question)):
                         triggered_rules.append(rule)
 
@@ -571,122 +571,53 @@ class Client:
         match_texts = []
 
         # Check if there are any rule filters, and if not, proceed with a default query
-        if not rule_filters:
-            # Perform a default query
-            query = {
-                "query": {
-                    "match": {
-                        "metadata.text": question
-                    }
-                },
-                "size": top_k
-            }
-            response = self.elasticsearch_client.search(index=f"{index}_{namespace}", body=query)
-            hits = response["hits"]["hits"]
-            for hit in hits:
-                match = hit["_source"]
-                matches.append(PineconeMatch(
-                    id=match["id"],
-                    score=None,  # Score not used in Elasticsearch
-                    metadata=PineconeMetadata(
-                        text=match["metadata"]["text"],
-                        page_number=match["metadata"]["page_number"],
-                        chunk_number=match["metadata"]["chunk_number"],
-                        filename=match["metadata"]["filename"],
-                        uuid=match["metadata"]["uuid"]
-                    )
-                ))
-                match_texts.append(match["metadata"]["text"])
 
-        else:
-            if process_rules_separately:
-                for rule_filter in rule_filters:
-                    if rule_filter:
-                        query = {
-                            "query": {
-                                "bool": {
-                                    "filter": rule_filter,
-                                    "must": {
-                                        "match": {
-                                            "metadata.text": question
-                                        }
-                                    }
-                                }
-                            },
-                            "size": top_k
-                        }
-                        response = self.elasticsearch_client.search(index=f"{index}_{namespace}")
-                        hits = response["hits"]["hits"]
-                        for hit in hits:
-                            match = hit["_source"]
-                            matches.append(PineconeMatch(
-                                id=match["id"],
-                                score=None,  # Score not used in Elasticsearch
-                                metadata=PineconeMetadata(
-                                    text=match["metadata"]["text"],
-                                    page_number=match["metadata"]["page_number"],
-                                    chunk_number=match["metadata"]["chunk_number"],
-                                    filename=match["metadata"]["filename"],
-                                    uuid=match["metadata"]["uuid"]
-                                )
-                            ))
-                            match_texts.append(match["metadata"]["text"])
-            else:
-                if rule_filters:
-                    # Combine filters with AND operator
-                    print((rule_filters, "ruleeeeeee"))
-                    queries = []
+        for rule_filter in rule_filters:
+            print(rule_filter,"process_sepa")
+            queries = []
 
-                    # Loop over all filenames
-                    for filename_term in rule_filters[0]['bool']['must'][0]['term']['filename']:
-                        # Loop over all page numbers
-                        for page_number_term in rule_filters[0]['bool']['must'][1]['terms']['page_number']:
-                            # Create a query for each combination of filename and page number
-                            query = {
-                                "query": {
-                                    "bool": {
-                                        "must": [
-                                            {"match": {"metadata.page_number": page_number_term}},
-                                            {"match": {"metadata.filename": filename_term}}
-                                        ]
-                                    }
-                                }
-                            }
-                            # Append the query to the list of queries
-                            queries.append(query)
-
-                else:
-                    # Fallback to a default query when no rules are provided or valid
+            # Loop over all filenames
+            for filename_term in rule_filter['bool']['must'][0]['term']['filename']:
+                # Loop over all page numbers
+                for page_number_term in rule_filter['bool']['must'][1]['terms']['page_number']:
+                    # Create a query for each combination of filename and page number
                     query = {
+                        "size": top_k,
                         "query": {
-                            "match": {
-                                "metadata.text": question
+                            "bool": {
+                                "must": [
+                                    {"match": {"metadata.page_number": page_number_term}},
+                                    {"match": {"metadata.filename": filename_term}}
+                                ]
                             }
-                        },
-                        "size": top_k
+                        }
                     }
-                hitss=[]
-                for query in queries:
-                    response = self.elasticsearch_client.search(index=f"{index}_{namespace}", body=query)
-                    print(response, "responseeeee")
-                    hits = response["hits"]["hits"]
-                    hitss.append(hits)
-                    for hits in hitss:
-                        for hit in hits:
-                            match = hit["_source"]
-                            matches.append(PineconeMatch(
-                                id=match["id"],
-                                score=None,  # Score not used in Elasticsearch
-                                metadata=PineconeMetadata(
-                                    text=match["metadata"]["text"],
-                                    page_number=match["metadata"]["page_number"],
-                                    chunk_number=match["metadata"]["chunk_number"],
-                                    filename=match["metadata"]["filename"],
-                                    uuid=match["metadata"]["uuid"]
-                                )
-                            ))
-                            match_texts.append(match["metadata"]["text"])
-        print("----------------",match_texts)
+                    # Append the query to the list of queries
+                    print("///////////",query)
+                    queries.append(query)
+
+            hitss = []
+            for query in queries:
+                response = self.elasticsearch_client.search(index=f"{index}_{namespace}", body=query)
+                print("*-*-****--*--*-**-",response)
+                res = response["hits"]["hits"]
+                hitss.append(res)
+                for hits in hitss:
+                    for hit in hits:
+                        match = hit["_source"]
+                        matches.append(PineconeMatch(
+                            id=match["id"],
+                            score=None,  # Score not used in Elasticsearch
+                            metadata=PineconeMetadata(
+                                text=match["metadata"]["text"],
+                                page_number=match["metadata"]["page_number"],
+                                chunk_number=match["metadata"]["chunk_number"],
+                                filename=match["metadata"]["filename"],
+                                uuid=match["metadata"]["uuid"]
+                            )
+                        ))
+                        match_texts.append(match["metadata"]["text"])
+
         # Proceed to create prompt, send it to OpenAI, and handle the response
         prompt = self.create_prompt(question, match_texts)
         response = self.openai_client.chat.completions.create(
